@@ -1,0 +1,1612 @@
+---
+title: Nomogram for a machine learning model with categorical predictors to predict
+  binary outcome
+author: "Herdiantri Sufriyana, Emily Chia-Yu Su"
+date: "2024-01-15"
+output: html_document
+---
+
+# Programming environment
+
+```{r Determine settings, include=FALSE}
+seed=2024-01-15
+bioc_version='3.16'
+```
+
+```{r Determine computing requirements, include=FALSE}
+comp_req=
+  c(#,1 # 1 == file size >=25MB
+    #,2 # 2 == considerably-long computation
+    #,3 # 3 == RAM >=8 GB
+    #,4 # 4 == require GPU
+  )
+```
+
+```{r Load packages, include=FALSE}
+library(tidyverse)
+library(ggpubr)
+library(knitr)
+library(kableExtra)
+group_rows=dplyr::group_rows
+group_rows_kable=kableExtra::group_rows
+library(broom)
+library(pbapply)
+library(mlbench)
+```
+
+```{r Load custom functions, include=FALSE}
+source('R/tidy_raw_data-function.R')
+source('R/binarize_var-function.R')
+source('R/compute_metrics-function.R')
+source('R/calibration-function.R')
+source('R/decision-function.R')
+source('R/discrimination-function.R')
+```
+
+```{r Set theme, include=FALSE}
+dslabs::ds_theme_set()
+```
+
+# Load raw data
+
+```{r Load Breast Cancer dataset, include=FALSE}
+data('BreastCancer')
+```
+
+```{r Tidy up raw data, include=FALSE}
+dataset0=
+  BreastCancer %>%
+  tidy_raw_data(
+    outcome_var='Class'
+    ,excluded_var=c('Id')
+  )
+```
+
+# Data partition
+
+```{r Split data into train-val-test by 64-16-20, include=FALSE}
+partition=
+  list(NULL,NULL,NULL) %>%
+  `names<-`(c('training','validation','test'))
+
+set.seed(seed);partition$test=
+  dataset0 %>%
+  nrow() %>%
+  seq() %>%
+  sample(0.2*length(.),replace=F) %>%
+  sort()
+
+set.seed(seed);partition$validation=
+  dataset0 %>%
+  nrow() %>%
+  seq() %>%
+  setdiff(partition$test) %>%
+  sample(0.2*length(.),replace=F) %>%
+  sort()
+
+partition$training=
+  dataset0 %>%
+  nrow() %>%
+  seq() %>%
+  setdiff(c(partition$test,partition$validation)) %>%
+  sort()
+```
+
+# Data preprocessing
+
+```{r Summarize raw data of training set, include=FALSE}
+dataset0_sum=
+  dataset0 %>%
+  slice(partition$training) %>%
+  summary() %>%
+  as.data.frame() %>%
+  rename_all(str_to_lower) %>%
+  select(2,3) %>%
+  rename(variable=var2) %>%
+  filter(!is.na(freq)) %>%
+  separate(freq,c('category','freq'),sep='\\:') %>%
+  mutate_all(trimws)
+```
+
+```{r Binarize variables according to training set, include=FALSE}
+dataset1=
+  partition %>%
+  lapply(\(x)
+    dataset0 %>%
+      slice(x)
+  ) %>%
+  lapply(binarize_var,dataset0_sum)
+```
+
+# Predictive modeling
+
+## Predictor selection
+
+```{r Univariate regression analysis, include=FALSE}
+univar_reg=
+  dataset1$training %>%
+  colnames() %>%
+  .[.!='outcome'] %>%
+  `names<-`(as.character(.)) %>%
+  lapply(c,'outcome') %>%
+  lapply(rev) %>%
+  lapply(paste0,collapse='~') %>%
+  lapply(as.formula) %>%
+  lapply(\(x)
+    suppressWarnings(
+      x %>%
+        glm(family=binomial(link='logit'),data=dataset1$training)
+    )
+  ) %>%
+  lapply(tidy) %>%
+  lapply(filter,term!='(Intercept)') %>%
+  do.call(rbind,.) %>%
+  mutate(
+    or=exp(estimate)
+    ,lb=exp(estimate-qnorm(0.975)*std.error)
+    ,ub=exp(estimate+qnorm(0.975)*std.error)
+    ,fdr=p.adjust(p.value,method='BH')
+  )
+```
+
+```{r Select candidate predictors by univariate regression, include=FALSE}
+univar_predictor=
+  univar_reg %>%
+  filter(p.value<=0.05) %>%
+  # filter(fdr<=0.05) %>%
+  # filter(lb>=2 | ub<=(1/2)) %>%
+  pull(term)
+```
+
+```{r Intervariate regression analysis, include=FALSE}
+intervar_reg=
+  univar_predictor %>%
+  combn(2) %>%
+  t() %>%
+  as.data.frame() %>%
+  unite(formula,V1,V2,sep='~') %>%
+  pull(formula) %>%
+  `names<-`(as.character(.)) %>%
+  lapply(as.formula) %>%
+  lapply(\(x)
+    suppressWarnings(
+      x %>%
+        glm(family=binomial(link='logit'),data=dataset1$training)
+    )
+  ) %>%
+  lapply(tidy) %>%
+  lapply(filter,term!='(Intercept)') %>%
+  lapply(X=names(.),Y=.,\(X,Y)mutate(Y[[X]],term=X)) %>%
+  do.call(rbind,.) %>%
+  mutate(
+    or=exp(estimate)
+    ,lb=exp(estimate-qnorm(0.975)*std.error)
+    ,ub=exp(estimate+qnorm(0.975)*std.error)
+    ,fdr=p.adjust(p.value,method='BH')
+  ) %>%
+  separate(term,c('v1','v2'),sep='~')
+```
+
+```{r Multivariate regression analysis, include=FALSE}
+multivar_reg=
+  intervar_reg %>%
+  filter(p.value<=0.05) %>%
+  # filter(fdr<=0.05) %>%
+  # filter(lb>=2 | ub<=(1/2)) %>%
+  lapply(X=univar_predictor,Y=.,\(X,Y)
+    Y %>%
+      filter(v1==X|v2==X) %>%
+      select(v1,v2) %>%
+      gather() %>%
+      pull(value) %>%
+      unique() %>%
+      sort() %>%
+      .[.!=X] %>%
+      c(X) %>%
+      paste0(collapse='+') %>%
+      c(X) %>%
+      rev() %>%
+      paste0(collapse='+') %>%
+      c('outcome') %>%
+      rev() %>%
+      paste0(collapse='~') %>%
+      as.formula()
+  ) %>%
+  `names<-`(univar_predictor) %>%
+  lapply(\(x)
+    suppressWarnings(
+      x %>%
+        glm(family=binomial(link='logit'),data=dataset1$training)
+    )
+  ) %>%
+  lapply(tidy) %>%
+  lapply(filter,term!='(Intercept)') %>%
+  lapply(X=names(.),Y=.,\(X,Y)filter(Y[[X]],term==X)) %>%
+  do.call(rbind,.) %>%
+  mutate(
+    or=exp(estimate)
+    ,lb=exp(estimate-qnorm(0.975)*std.error)
+    ,ub=exp(estimate+qnorm(0.975)*std.error)
+    ,fdr=p.adjust(p.value,method='BH')
+  )
+```
+
+```{r Select candidate predictors by univariate regression, include=FALSE}
+multivar_predictor=
+  multivar_reg %>%
+  filter(p.value<=0.05) %>%
+  # filter(fdr<=0.05) %>%
+  # filter(lb>=2 | ub<=(1/2)) %>%
+  pull(term)
+```
+
+```{r Select only outcome and the selected candidate predictors, include=FALSE}
+dataset2=
+  dataset1 %>%
+  lapply(select_at,c('outcome',multivar_predictor))
+```
+
+## Model training
+
+```{r Sample weights by inverse outcome probability weighting, include=FALSE}
+dataset=
+  dataset2 %>%
+  lapply(\(x)
+    x %>%
+      left_join(
+        group_by(.,outcome) %>%
+          summarize(n=n()) %>%
+          mutate(
+            p=n/sum(n)
+            ,outcome_weight=
+              1/p*(1/sum(!is.na(outcome)))
+          ) %>%
+          select(outcome,outcome_weight)
+        ,by=join_by(outcome)
+      ) %>%
+      select(outcome,outcome_weight,everything())
+  )
+```
+
+```{r Write dataset to CSV for model training, eval=FALSE, include=FALSE}
+if(!dir.exists('data/model_input')) {
+    dir.create('data/model_input',recursive=T)
+}
+
+dataset %>%
+  lapply(X=names(.),Y=.,\(X,Y)
+    Y[[X]] %>%
+      write_csv(paste0('data/model_input/',X,'.csv'))
+  )
+```
+
+## Model selection
+
+```{r List modeling result files, include=FALSE}
+modeling_results=
+  list.files('data/sklearn_models',full.names=T,recursive=T) %>%
+  data.frame(path=.) %>%
+  mutate(
+    model=
+      path %>%
+      sapply(\(x)str_split(x,'/')) %>%
+      sapply(\(x)paste0(x[3],':',x[2]))
+  ) %>%
+  separate(model,c('algorithm','platform'),sep='\\:') %>%
+  mutate_at('platform',str_remove_all,'_models') %>%
+  select(algorithm,platform,everything()) %>%
+  arrange(
+    algorithm %>%
+      factor(c('rr','rf','gb'))
+    ,platform %>%
+      factor(c('sklearn'))
+  )
+```
+
+```{r List the best hyperparameters, include=FALSE}
+best_hyperparams=
+  modeling_results %>%
+  filter(str_detect(path,'best_hyperparams')) %>%
+  pull(path) %>%
+  `names<-`(as.character(.)) %>%
+  lapply(read_csv,show_col_types=F) %>%
+  lapply(gather,hyperparameter,value) %>%
+  lapply(X=names(.),Y=.,\(X,Y)
+    Y[[X]] %>%
+      mutate(path=X)
+  ) %>%
+  do.call(rbind,.) %>%
+  mutate(
+    model=
+      path %>%
+      sapply(\(x)str_split(x,'/')) %>%
+      sapply(\(x)paste0(x[3],':',x[2]))
+  ) %>%
+  separate(model,c('algorithm','platform'),sep='\\:') %>%
+  mutate_at('platform',str_remove_all,'_models') %>%
+  select(algorithm,platform,everything()) %>%
+  arrange(
+    algorithm %>%
+      factor(c('rr','rf','gb'))
+    ,platform %>%
+      factor(c('sklearn'))
+  )
+```
+
+```{r List the best models' predictions, include=FALSE}
+best_models=
+  modeling_results %>%
+  filter(str_detect(path,'prob_')) %>%
+  pull(path) %>%
+  `names<-`(as.character(.)) %>%
+  lapply(read_csv,show_col_types=F) %>%
+  lapply(X=names(.),Y=.,\(X,Y)
+    data.frame(path=X) %>%
+      mutate(
+        model=
+          path %>%
+          sapply(\(x)str_split(x,'/')) %>%
+          sapply(\(x)paste0(x[3],':',x[2],':',x[4]))
+      ) %>%
+      separate(model,c('algorithm','platform','data'),sep='\\:') %>%
+      mutate_at('platform',str_remove_all,'_models') %>%
+      mutate_at('data',str_remove_all,'prob_|\\.csv') %>%
+      select(algorithm,data,platform,everything()) %>%
+      cbind(Y[[X]])
+  ) %>%
+  do.call(rbind,.) %>%
+  arrange(
+    algorithm %>%
+      factor(
+        c('rr'
+          ,'rf'
+          ,'gb'
+        )
+      )
+    ,platform %>%
+      factor(c('sklearn'))
+  )
+```
+
+```{r Model calibration-clinical utility-discrimination by val, include=FALSE}
+if(all(c(1,2,3)%in%comp_req)){ # 12s
+  tmp=
+    best_models %>%
+    unite(model_eval,algorithm,data,platform,sep='_') %>%
+    pull(model_eval) %>%
+    .[!duplicated(.)] %>%
+    .[str_detect(.,'validation')] %>%
+    lapply(\(x)
+      best_models %>%
+        unite(model_eval,algorithm,data,platform,sep='_') %>%
+        filter(model_eval==x) %>%
+        select(outcome,prob) %>%
+        rename(obs=outcome,pred=prob) %>%
+        mutate(
+          obs=
+            obs %>%
+            factor()
+        ) %>%
+        list(pred_data=.) %>%
+        c(list(name=x))
+    ) %>%
+    lapply(\(x)
+      list(
+        list(
+          pred_data=x$pred_data
+          ,eval=calibration
+          ,name=paste0(x$name,'_calibration')
+        )
+        ,list(
+          pred_data=x$pred_data
+          ,eval=discrimination
+          ,name=paste0(x$name,'_discrimination')
+        )
+        ,list(
+          pred_data=x$pred_data
+          ,eval=decision
+          ,name=paste0(x$name,'_decision')
+        )
+      )
+    ) %>%
+    do.call(c,.)
+  
+  if(!dir.exists('data/eval')) {
+    dir.create('data/eval',recursive=T)
+  }
+  
+  tmp %>%
+    pblapply(
+      \(x)
+        x$pred_data %>%
+          x$eval() %>%
+          saveRDS(paste0('data/eval/',x$name,'.rds'))
+    )
+  
+  rm(tmp)
+}
+```
+
+```{r Rearrange the val evaluation results, include=FALSE}
+eval=
+  list.files('data/eval',full.names=T,recursive=T) %>%
+  .[str_detect(.,'validation')] %>%
+  `names<-`(as.character(.)) %>%
+  lapply(readRDS) %>%
+  lapply(
+    X=names(.) %>%
+      str_remove_all('_calibration|_discrimination|_decision|\\.rds') %>%
+      .[!duplicated(.)]
+    ,Y=.
+    ,\(X,Y)
+      Y %>%
+        .[str_detect(names(.),X)] %>%
+        `names<-`(
+          names(.) %>%
+            str_remove_all(X) %>%
+            str_remove_all('_|\\.rds')
+        )
+  ) %>%
+  `names<-`(
+      list.files('data/eval',full.names=T,recursive=T) %>%
+        .[str_detect(.,'validation')] %>%
+        str_remove_all(
+          'data/eval/|_calibration|_discrimination|_decision|\\.rds'
+        ) %>%
+        .[!duplicated(.)]
+  )
+
+eval_all=
+  eval %>%
+  lapply(X=names(.),Y=.,function(X,Y)
+    Y[[X]]$calibration$metrics %>%
+      rbind(Y[[X]]$discrimination$metrics) %>%
+      rbind(Y[[X]]$decision$metrics) %>%
+      mutate(model=X)
+  ) %>%
+  do.call(rbind,.) %>%
+  mutate_at('model',str_remove_all,'_validation') %>%
+  separate(model,c('algorithm','platform'),sep='_') %>%
+  mutate_at(
+    'algorithm'
+    ,\(x)
+      x %>%
+        factor(
+          c('rr'
+            ,'rf'
+            ,'gb'
+          )
+        )
+  ) %>%
+  mutate_at('platform',factor,c('sklearn')) %>%
+  arrange(algorithm,platform) %>%
+  mutate(data='validation') %>%
+  unite(model,algorithm,data,platform,sep='_')
+
+eval=
+  eval %>%
+  .[eval_all$model %>%
+      .[!duplicated(.)]
+  ]
+```
+
+```{r Arrange and merge val calibrations of all models, include=FALSE}
+all_calib=
+  eval %>%
+  lapply(\(x)
+    suppressMessages(suppressWarnings(
+      ggarrange(
+        x$calibration$plot +
+          scale_x_continuous(breaks=seq(0,1,0.25),limits=c(0,1))
+        ,x$calibration$dist +
+          scale_x_continuous(breaks=seq(0,1,0.25),limits=c(0,1))
+        ,ncol=1
+        ,nrow=2
+        ,widths=c(3)
+        ,heights=c(2.75,3)
+      )
+    ))
+  )
+```
+
+```{r Arrange and merge val DC & ROC of all models, include=FALSE}
+all_dec_disc=
+  eval %>%
+  lapply(\(x)
+    suppressMessages(suppressWarnings(
+      ggarrange(
+        x$decision$plot +
+          scale_x_continuous(limits=c(0,1)) +
+          scale_y_continuous(limits=c(0,0.40))
+        ,x$discrimination$plot
+        ,ncol=1
+        ,nrow=2
+        ,widths=c(3)
+        ,heights=c(3,3)
+      )
+    ))
+  )
+```
+
+```{r figure-s1, eval=FALSE, fig.height=11.75, fig.width=9, include=FALSE}
+ggarrange(
+  ggarrange(
+    all_calib$rr_validation_sklearn
+    ,all_calib$rf_validation_sklearn
+    ,all_calib$gb_validation_sklearn
+    ,nrow=1
+    ,ncol=3
+    ,widths=c(3,3,3)
+    ,heights=c(5.75)
+    ,labels=
+      c('RR'
+        ,'RF'
+        ,'GB'
+      )
+    ,hjust=-2.75
+  )
+  ,ggarrange(
+    all_dec_disc$rr_validation_sklearn
+    ,all_dec_disc$rf_validation_sklearn
+    ,all_dec_disc$gb_validation_sklearn
+    ,nrow=1
+    ,ncol=3
+    ,widths=c(3,3,3)
+    ,heights=c(6)
+  )
+  ,ncol=1
+  ,nrow=2
+  ,widths=9
+  ,heights=c(5.75,6)
+)
+```
+
+# Best model
+
+## Predictive performance
+
+```{r Model calibration-clinical utility-discrimination by train, include=FALSE}
+if(all(c(1,2,3)%in%comp_req)){ # 18s
+  tmp=
+    best_models %>%
+    unite(model_eval,algorithm,data,platform,sep='_') %>%
+    pull(model_eval) %>%
+    .[!duplicated(.)] %>%
+    .[str_detect(.,'training')] %>%
+    lapply(\(x)
+      best_models %>%
+        unite(model_eval,algorithm,data,platform,sep='_') %>%
+        filter(model_eval==x) %>%
+        select(outcome,prob) %>%
+        rename(obs=outcome,pred=prob) %>%
+        mutate(
+          obs=
+            obs %>%
+            factor()
+        ) %>%
+        list(pred_data=.) %>%
+        c(list(name=x))
+    ) %>%
+    lapply(\(x)
+      list(
+        list(
+          pred_data=x$pred_data
+          ,eval=calibration
+          ,name=paste0(x$name,'_calibration')
+        )
+        ,list(
+          pred_data=x$pred_data
+          ,eval=discrimination
+          ,name=paste0(x$name,'_discrimination')
+        )
+        ,list(
+          pred_data=x$pred_data
+          ,eval=decision
+          ,name=paste0(x$name,'_decision')
+        )
+      )
+    ) %>%
+    do.call(c,.)
+  
+  if(!dir.exists('data/eval_training')) {
+    dir.create('data/eval_training',recursive=T)
+  }
+  
+  tmp %>%
+    pblapply(
+      \(x)
+        x$pred_data %>%
+          x$eval() %>%
+          saveRDS(paste0('data/eval_training/',x$name,'.rds'))
+    )
+  
+  rm(tmp)
+}
+```
+
+```{r Rearrange the training evaluation results, include=FALSE}
+eval_training=
+  list.files('data/eval_training',full.names=T,recursive=T) %>%
+  .[str_detect(.,'training')] %>%
+  `names<-`(as.character(.)) %>%
+  lapply(readRDS) %>%
+  lapply(
+    X=names(.) %>%
+      str_remove_all('_calibration|_discrimination|_decision|\\.rds') %>%
+      .[!duplicated(.)]
+    ,Y=.
+    ,\(X,Y)
+      Y %>%
+        .[str_detect(names(.),X)] %>%
+        `names<-`(
+          names(.) %>%
+            str_remove_all(X) %>%
+            str_remove_all('_|\\.rds')
+        )
+  ) %>%
+  `names<-`(
+      list.files('data/eval_training',full.names=T,recursive=T) %>%
+        .[str_detect(.,'training')] %>%
+        str_remove_all(
+          'data/eval_training/|_calibration|_discrimination|_decision|\\.rds'
+        ) %>%
+        .[!duplicated(.)]
+  )
+
+eval_training_all=
+  eval_training %>%
+  lapply(X=names(.),Y=.,function(X,Y)
+    Y[[X]]$calibration$metrics %>%
+      rbind(Y[[X]]$discrimination$metrics) %>%
+      rbind(Y[[X]]$decision$metrics) %>%
+      mutate(model=X)
+  ) %>%
+  do.call(rbind,.) %>%
+  mutate_at('model',str_remove_all,'_training') %>%
+  separate(model,c('algorithm','platform'),sep='_') %>%
+  mutate_at(
+    'algorithm'
+    ,\(x)
+      x %>%
+        factor(
+          c('rr'
+            ,'rf'
+            ,'gb'
+          )
+        )
+  ) %>%
+  mutate_at('platform',factor,c('sklearn')) %>%
+  arrange(algorithm,platform) %>%
+  mutate(data='training') %>%
+  unite(model,algorithm,data,platform,sep='_')
+
+eval_training=
+  eval_training %>%
+  .[eval_training_all$model %>%
+      .[!duplicated(.)]
+  ]
+```
+
+```{r Training threshold by max. NB diff. to treat-all & -none, include=FALSE}
+best_model_threshold=
+  eval_training %>%
+  .[names(.)=='rf_training_sklearn'] %>%
+  .[[1]] %>%
+  .$decision %>%
+  .$plot %>%
+  .$data %>%
+  mutate(
+    excess_nb=
+      nb-sapply(max(nb,na.rm=T)-1*th,\(x)max(c(x,0)))
+  ) %>%
+  filter(excess_nb==max(excess_nb,na.rm=T)) %>%
+  slice(1) %>%
+  pull(th)
+```
+
+```{r Model calibration-clinical utility-discrimination by test, include=FALSE}
+if(all(c(1,2,3)%in%comp_req)){ # 15s
+  tmp=
+    best_models %>%
+    unite(model_eval,algorithm,data,platform,sep='_') %>%
+    pull(model_eval) %>%
+    .[!duplicated(.)] %>%
+    .[str_detect(.,'test')] %>%
+    lapply(\(x)
+      best_models %>%
+        unite(model_eval,algorithm,data,platform,sep='_') %>%
+        filter(model_eval==x) %>%
+        select(outcome,prob) %>%
+        rename(obs=outcome,pred=prob) %>%
+        mutate(
+          obs=
+            obs %>%
+            factor()
+        ) %>%
+        list(pred_data=.) %>%
+        c(list(name=x))
+    ) %>%
+    lapply(\(x)
+      list(
+        list(
+          pred_data=x$pred_data
+          ,eval=calibration
+          ,name=paste0(x$name,'_calibration')
+        )
+        ,list(
+          pred_data=x$pred_data
+          ,eval=discrimination
+          ,name=paste0(x$name,'_discrimination')
+        )
+        ,list(
+          pred_data=x$pred_data
+          ,eval=decision
+          ,name=paste0(x$name,'_decision')
+        )
+      )
+    ) %>%
+    do.call(c,.)
+  
+  if(!dir.exists('data/eval_test')) {
+    dir.create('data/eval_test',recursive=T)
+  }
+  
+  tmp %>%
+    pblapply(
+      \(x)
+        x$pred_data %>%
+          x$eval() %>%
+          saveRDS(paste0('data/eval_test/',x$name,'.rds'))
+    )
+  
+  rm(tmp)
+}
+```
+
+```{r Rearrange the test evaluation results, include=FALSE}
+eval_test=
+  list.files('data/eval_test',full.names=T,recursive=T) %>%
+  .[str_detect(.,'test')] %>%
+  `names<-`(as.character(.)) %>%
+  lapply(readRDS) %>%
+  lapply(
+    X=names(.) %>%
+      str_remove_all('_calibration|_discrimination|_decision|\\.rds') %>%
+      .[!duplicated(.)]
+    ,Y=.
+    ,\(X,Y)
+      Y %>%
+        .[str_detect(names(.),X)] %>%
+        `names<-`(
+          names(.) %>%
+            str_remove_all(X) %>%
+            str_remove_all('_|\\.rds')
+        )
+  ) %>%
+  `names<-`(
+      list.files('data/eval_test',full.names=T,recursive=T) %>%
+        .[str_detect(.,'test')] %>%
+        str_remove_all(
+          'data/eval_test/|_calibration|_discrimination|_decision|\\.rds'
+        ) %>%
+        .[!duplicated(.)]
+  )
+
+eval_test_all=
+  eval_test %>%
+  lapply(X=names(.),Y=.,function(X,Y)
+    Y[[X]]$calibration$metrics %>%
+      rbind(Y[[X]]$discrimination$metrics) %>%
+      rbind(Y[[X]]$decision$metrics) %>%
+      mutate(model=X)
+  ) %>%
+  do.call(rbind,.) %>%
+  mutate_at('model',str_remove_all,'_test') %>%
+  separate(model,c('algorithm','platform'),sep='_') %>%
+  mutate_at(
+    'algorithm'
+    ,\(x)
+      x %>%
+        factor(
+          c('rr'
+            ,'rf'
+            ,'gb'
+          )
+        )
+  ) %>%
+  mutate_at('platform',factor,c('sklearn')) %>%
+  arrange(algorithm,platform) %>%
+  mutate(data='test') %>%
+  unite(model,algorithm,data,platform,sep='_')
+
+eval_test=
+  eval_test %>%
+  .[eval_test_all$model %>%
+      .[!duplicated(.)]
+  ]
+```
+
+```{r Rearrange list for reporting, include=FALSE}
+eval_report=
+  eval_test %>%
+  names() %>%
+  str_remove_all('_test') %>%
+  .[!duplicated(.)] %>%
+  sapply(\(x)paste0('^',x,'$')) %>%
+  lapply(\(x)str_split(x,'_')[[1]]) %>%
+  lapply(\(x)
+    eval_test %>%
+      .[str_detect(names(.),x[1])] %>%
+      .[str_detect(names(.),x[2])]
+  )
+```
+
+```{r Arrange and merge best model test calibration, include=FALSE}
+best_calib=
+  eval_report$rf_sklearn %>%
+  .[names(.)=='rf_test_sklearn'] %>%
+  lapply(\(x)
+    suppressMessages(suppressWarnings(
+      ggarrange(
+        x$calibration$plot +
+          geom_vline(
+            xintercept=
+              round(
+                best_model_threshold
+                ,1
+              )
+            ,lty=2
+            ,na.rm=T
+          ) +
+          annotate(
+            x=0.1
+            ,y=0.9
+            ,geom='label'
+            ,label=
+              paste0(
+                'Intercept '
+                ,round(filter(x$calibration$metrics,term=='intercept')$estimate,3)
+                ,' ('
+                ,round(
+                  filter(x$calibration$metrics,term=='intercept')$estimate
+                  -filter(x$calibration$metrics,term=='intercept')$ci
+                  ,3
+                )
+                ,', '
+                ,round(
+                  filter(x$calibration$metrics,term=='intercept')$estimate
+                  +filter(x$calibration$metrics,term=='intercept')$ci
+                  ,3
+                )
+                ,')'
+                ,'\n'
+                ,'Slope '
+                ,round(filter(x$calibration$metrics,term=='slope')$estimate,3)
+                ,' ('
+                ,round(
+                  filter(x$calibration$metrics,term=='slope')$estimate
+                  -filter(x$calibration$metrics,term=='slope')$ci
+                  ,3
+                )
+                ,', '
+                ,round(
+                  filter(x$calibration$metrics,term=='slope')$estimate
+                  +filter(x$calibration$metrics,term=='slope')$ci
+                  ,3
+                )
+                ,')'
+                ,'\n'
+                ,'Brier score '
+                ,round(filter(x$calibration$metrics,term=='rmse')$estimate,3)
+                ,' ('
+                ,round(
+                  filter(x$calibration$metrics,term=='rmse')$estimate
+                  -filter(x$calibration$metrics,term=='rmse')$ci
+                  ,3
+                )
+                ,', '
+                ,round(
+                  filter(x$calibration$metrics,term=='rmse')$estimate
+                  +filter(x$calibration$metrics,term=='rmse')$ci
+                  ,3
+                )
+                ,')'
+              )
+            ,hjust=0
+            ,size=3
+          ) +
+          xlab('Predicted probability') +
+          ylab('True probability (95% CI)') +
+          theme(
+            axis.title.x=element_blank()
+            ,axis.text.x=element_blank()
+          )
+        ,x$calibration$dist +
+          geom_vline(
+            xintercept=
+              round(
+                best_model_threshold
+                ,1
+              )
+            ,lty=2
+            ,na.rm=T
+          ) +
+          xlab('Predicted probability') +
+          ylab('Frequency')
+        ,nrow=2
+        ,ncol=1
+        ,heights=c(3.7,2.3)
+      )
+    ))
+  )
+```
+
+```{r Arrange and merge best model test DC & ROC, include=FALSE}
+best_dec_disc=
+  eval_report$rf_sklearn %>%
+  .[names(.)=='rf_test_sklearn'] %>%
+  lapply(\(x)
+    suppressMessages(suppressWarnings(
+      ggarrange(
+        x$decision$plot +
+          geom_vline(
+            xintercept=best_model_threshold
+            ,lty=2
+            ,na.rm=T
+          ) +
+          scale_x_continuous(
+            'Threshold'
+            ,breaks=seq(0,1,0.1)
+            ,limits=c(0,1)
+          ) +
+          scale_y_continuous(
+            'Net benefit'
+            ,breaks=seq(0,0.4,0.05)
+            ,limits=c(-0.01,0.4)
+          )
+        ,x$discrimination$plot$data %>%
+          ggplot(aes(tnr,tpr)) +
+          geom_abline(slope=1,intercept=1,lty=2) +
+          geom_vline(
+            xintercept=
+              filter(
+                x$discrimination$plot$data
+                ,th==best_model_threshold
+              )$tnr
+            ,lty=2
+            ,na.rm=T
+          ) +
+          geom_hline(
+            yintercept=
+              filter(
+                x$discrimination$plot$data
+                ,th==best_model_threshold
+              )$tpr
+            ,lty=2
+            ,na.rm=T
+          ) +
+          geom_path() +
+          geom_point(
+            aes(
+              x=ifelse(
+                th==best_model_threshold
+                ,tnr
+                ,NA
+              )
+            )
+            ,na.rm=T
+          ) +
+          geom_text(
+            aes(
+              label=
+                ifelse(
+                  th==best_model_threshold
+                  ,round(th,2)
+                  ,NA
+                )
+            )
+            ,hjust=-0.1
+            ,vjust=1.1
+            ,size=3
+            ,check_overlap=T
+            ,na.rm=T
+          ) +
+          coord_equal() +
+          scale_x_reverse(breaks=seq(0,1,0.1)) +
+          scale_y_continuous(breaks=seq(0,1,0.1)) +
+          theme_classic() +
+          xlab('Specificity') +
+          ylab('Sensitivity')
+        ,ncol=2
+        ,nrow=1
+        ,widths=c(4,6)
+        ,heights=c(6)
+        ,labels=LETTERS[2:3]
+      )
+    ))
+  )
+```
+
+```{r figure-1, echo=FALSE, fig.height=6, fig.width=15}
+ggarrange(
+    best_calib[[1]]
+    ,best_dec_disc[[1]]
+    ,nrow=1
+    ,ncol=2
+    ,widths=c(5,10)
+    ,labels=c(LETTERS[1],'')
+  )
+
+# suppressMessages(suppressWarnings(ggsave('figure1.eps',height=6,width=15)))
+```
+
+## Explainability
+
+```{r List all model SHAP values, include=FALSE}
+shap_values=
+  list.files('data/sklearn_models',full.names=T,recursive=T) %>%
+  .[str_detect(.,'shap_values')] %>%
+  .[str_detect(.,'\\.csv')] %>%
+  `names<-`(
+    as.character(.) %>%
+      str_split('\\/') %>%
+      sapply(\(x)
+        paste0(
+          x[3]
+          ,'_'
+          ,x[2] %>%
+            str_remove_all('_models')
+        )
+      )
+  ) %>%
+  lapply(read_csv,show_col_types=F) %>%
+  .[c('rr_sklearn'
+      ,'rf_sklearn'
+      ,'gb_sklearn'
+    )
+  ]
+```
+
+```{r List all model feature values sorted by SHAP magnitudes, include=FALSE}
+shap_feature_values=
+  shap_values %>%
+  lapply(\(x)mutate(x,seq=seq(nrow(x)))) %>%
+  lapply(gather,feature,shap_value,-seq) %>%
+  pblapply(X=names(.),Y=.,\(X,Y)
+    Y[[X]] %>%
+      left_join(
+        read_csv(
+            'data/model_input/training.csv'
+            ,show_col_types=F
+          ) %>%
+          select(-outcome,-outcome_weight) %>%
+          mutate(seq=seq(nrow(.))) %>%
+          gather(feature,feature_value,-seq)
+        ,by=c('seq','feature')
+      ) %>%
+      left_join(
+        read_csv(
+            paste0(
+              'data/sklearn_models/'
+              ,str_split_fixed(X,'_',2)[[1]]
+              ,'/prob_training.csv'
+            )
+            ,show_col_types=F
+          ) %>%
+          mutate(seq=seq(nrow(.)))
+        ,by=c('seq')
+      )
+  ) %>%
+  `names<-`(names(shap_values)) %>%
+  pblapply(\(x)
+    x %>%
+      group_by(feature) %>%
+      mutate(
+        direction=mean(shap_value>=0)
+        ,magnitude=max(shap_value)
+      ) %>%
+      ungroup() %>%
+      mutate(
+        magnitude=
+          (magnitude-min(magnitude))/(max(magnitude)-min(magnitude))
+        ,impact=
+          0.5*direction+0.5*magnitude
+      ) %>%
+      mutate(feature=reorder(feature,magnitude)) %>%
+      arrange(seq,feature)
+  )
+```
+
+```{r Obtain all model beeswarm plots, include=FALSE}
+set.seed(seed);shap_beeswarm_plots=
+  shap_feature_values %>%
+  lapply(\(x)
+    x %>%
+      mutate(shap_value_bin=round(shap_value*100,0)/100) %>%
+      group_by(feature,shap_value_bin) %>% 
+      mutate(freq=n()) %>% 
+      ungroup() %>%
+      mutate(
+        jitter_width=freq/max(freq)*0.1
+        ,feature_num=as.numeric(feature)
+        ,jitter_feature=feature_num+runif(n(),-jitter_width,jitter_width)
+      )
+  ) %>%  
+  lapply(\(x)
+    x %>%
+      ggplot(aes(jitter_feature,shap_value,color=feature_value)) +
+      geom_hline(yintercept=0,color='grey',linewidth=1) +
+      geom_point(
+        position='identity'
+        ,size=1.5
+        # ,alpha=0.1
+      ) +
+      coord_flip() +
+      scale_x_continuous(
+        breaks=unique(x %>% select(feature,feature_num))$feature_num
+        ,labels=
+          paste0(
+            unique(x %>% select(feature,feature_num))$feature
+            ,' - '
+            ,max(x$feature_num)
+             -unique(x %>% select(feature,feature_num))$feature_num
+             +1
+          )
+      ) +
+      scale_color_gradient(
+        'Feature value'
+        ,low='#008AFB'
+        ,high='#FF0053'
+        ,breaks=c(min(x$feature_value),max(x$feature_value))
+        ,labels=c('Low','High')
+      ) +
+      theme_minimal() +
+      xlab('') +
+      ylab('SHAP value (impact on model output)') +
+      theme(
+        panel.grid.major=element_blank()
+        ,panel.grid.minor=element_blank()
+        ,axis.ticks.x=element_line()
+        ,axis.line.x=element_line()
+        ,legend.position='right'
+        ,legend.title=element_text(angle=90,hjust=0.5)
+      ) +
+      guides(
+        color=
+          guide_colorbar(
+            barwidth=0.2
+            ,barheight=10
+            ,title.position='right'
+            ,title.hjust=0.5
+            ,label.hjust=0.5
+            ,ticks=F
+            ,draw.ulim=T
+            ,draw.llim=T
+          )
+      )
+  )
+```
+
+```{r Obtain best model beeswarm plot, include=FALSE}
+best_model_beeswarm=
+  shap_beeswarm_plots %>%
+  .[str_detect(names(.),'rf_sklearn')] %>%
+  .[[1]]
+```
+
+```{r figure-2, echo=FALSE, fig.height=3, fig.width=10}
+best_model_beeswarm
+
+suppressMessages(suppressWarnings(ggsave('figure2.eps',height=3,width=10)))
+```
+
+# Create nomogram
+
+```{r Synthesize dataset for creating nomogram, eval=FALSE, include=FALSE}
+data.frame(
+    outcome=as.numeric(NA)
+    ,outcome_onset=as.numeric(NA)
+    ,outcome_weight=as.numeric(NA)
+  ) %>%
+  cbind(
+    dataset$training %>%
+      .[,colnames(.) %>%
+          .[!.%in%c('outcome','outcome_onset','outcome_weight')]
+      ] %>%
+      lapply(unique) %>%
+      expand.grid()
+  ) %>%
+  write_csv('data/dataset_nomogram.csv')
+```
+
+```{r Load nomogram dataset with predicted probabilities, include=FALSE}
+nomogram_data=
+  paste0(
+    'data/sklearn_models/'
+    ,'rf/'
+    ,'prob_dataset_nomogram.csv'
+  ) %>%
+  read_csv(show_col_types=F) %>%
+  cbind(read_csv('data/dataset_nomogram.csv',show_col_types=F))
+```
+
+```{r Sort features by SHAP magnitudes, include=FALSE}
+sorted_nomogram_data=
+  nomogram_data %>%
+  select_at(
+    c('prob'
+      ,shap_feature_values$rf_sklearn$feature %>%
+        levels() %>%
+        rev()
+    )
+  )
+```
+
+```{r Obtain feature combinations being predicted positive, include=FALSE}
+pos_pred_features=list()
+
+i=0
+pb=txtProgressBar(min=i,max=ncol(sorted_nomogram_data)-1,style=3)
+for(colseq in seq(2,ncol(sorted_nomogram_data))){
+  pos_pred_features[[colseq-1]]=
+    sorted_nomogram_data %>%
+    select_at(c(1,2:colseq)) %>%
+    mutate(
+      value=
+        sapply(X=seq(n()),Y=.,\(X,Y)
+          paste0(
+            Y[X,-1,drop=T]
+            ,collapse='/'
+          )
+        )
+      ,variable=
+        paste0(
+          colnames(.) %>%
+            .[-1]
+          ,collapse='/'
+        )
+    )
+  
+  if(colseq>2){
+    avail_values=
+      pos_pred_features[-(colseq-1)] %>%
+      do.call(rbind,.) %>%
+      pull(value)
+    
+    if(length(avail_values)>0){
+      pos_pred_features[[colseq-1]]=
+        pos_pred_features[[colseq-1]] %>%
+        filter(
+          !str_detect(
+            value
+            ,paste0(
+                '^'
+                ,pos_pred_features[-(colseq-1)] %>%
+                  do.call(rbind,.) %>%
+                  pull(value)
+              ) %>%
+              paste0(collapse='|')
+          )
+        )
+    }
+  }
+  
+  pos_pred_features[[colseq-1]]=
+    pos_pred_features[[colseq-1]] %>%
+    group_by(variable,value) %>%
+    summarize(
+      min=suppressWarnings(min(prob))
+      ,med=suppressWarnings(median(prob))
+      ,max=suppressWarnings(max(prob))
+      ,.groups='drop'
+    ) %>%
+    filter(min>=best_model_threshold)
+  
+  i=i+1
+  setTxtProgressBar(pb,i)
+}
+
+close(pb)
+rm(i,pb,colseq,avail_values)
+
+pos_pred_features=
+  pos_pred_features %>%
+  do.call(rbind,.)
+```
+
+```{r Obtain feature combinations being predicted negative, include=FALSE}
+neg_pred_features=list()
+
+i=0
+pb=txtProgressBar(min=i,max=ncol(sorted_nomogram_data)-1,style=3)
+for(colseq in rev(seq(2,ncol(sorted_nomogram_data)))){
+  neg_pred_features[[colseq-1]]=
+    sorted_nomogram_data %>%
+    select_at(c(1,2:colseq)) %>%
+    mutate(
+      value=
+        sapply(X=seq(n()),Y=.,\(X,Y)
+          paste0(
+            Y[X,-1,drop=T]
+            ,collapse='/'
+          )
+        )
+      ,variable=
+        paste0(
+          colnames(.) %>%
+            .[-1]
+          ,collapse='/'
+        )
+    )
+  
+  if(colseq<ncol(sorted_nomogram_data)){
+    
+    avail_values=
+      neg_pred_features[-(colseq-1)] %>%
+      do.call(rbind,.) %>%
+      pull(value)
+    
+    if(length(avail_values)>0){
+      neg_pred_features[[colseq-1]]=
+        neg_pred_features[[colseq-1]] %>%
+        filter(
+          !str_detect(
+            value
+            ,paste0(
+                '^'
+                ,neg_pred_features[-(colseq-1)] %>%
+                  do.call(rbind,.) %>%
+                  pull(value)
+              ) %>%
+              paste0(collapse='|')
+          )
+        )
+    }
+  }
+  
+  neg_pred_features[[colseq-1]]=
+    neg_pred_features[[colseq-1]] %>%
+    group_by(variable,value) %>%
+    summarize(
+      min=suppressWarnings(min(prob))
+      ,med=suppressWarnings(median(prob))
+      ,max=suppressWarnings(max(prob))
+      ,.groups='drop'
+    ) %>%
+    filter(max<best_model_threshold)
+  
+  i=i+1
+  setTxtProgressBar(pb,i)
+}
+
+close(pb)
+rm(i,pb,colseq,avail_values)
+
+neg_pred_features=
+  neg_pred_features %>%
+  do.call(rbind,.)
+```
+
+```{r Obtain feature combinations in training set, include=FALSE}
+feat_hie_comb_dataset_training=
+  dataset$training %>%
+  .[,colnames(.) %>%
+      .[!.%in%c('outcome','outcome_onset','outcome_weight')]
+  ] %>%
+  select_at(
+    sorted_nomogram_data %>%
+      colnames() %>%
+      .[!.%in%c('prob','outcome','outcome_onset','outcome_weight')]
+  ) %>%
+  pblapply(X=seq(ncol(.)),Y=.,\(X,Y)
+    Y %>%
+      select_at(seq(X)) %>%
+      mutate(
+        value=
+          sapply(X=seq(n()),Y=.,\(X,Y)
+            paste0(
+              Y[X,,drop=T]
+              ,collapse='/'
+            )
+          )
+        ,variable=
+          paste0(
+            Y %>%
+              colnames() %>%
+              .[seq(X)]
+            ,collapse='/'
+          )
+      ) %>%
+      group_by(variable,value) %>%
+      summarize(
+        n=n()
+        ,.groups='drop'
+      )
+  ) %>%
+  do.call(rbind,.) %>%
+  mutate(
+    pred=
+      case_when(
+        str_detect(
+          variable
+          ,paste0('^',pos_pred_features$variable) %>%
+            paste0(collapse='|')
+        )
+        & str_detect(
+          value
+          ,paste0('^',pos_pred_features$value) %>%
+            str_replace_all('-','[01]') %>%
+            paste0(collapse='|')
+        )
+        ~'positive'
+        
+        ,str_detect(
+          variable
+          ,paste0('^',neg_pred_features$variable) %>%
+            paste0(collapse='|')
+        )
+        & str_detect(
+          value
+          ,paste0('^',neg_pred_features$value) %>%
+            paste0(collapse='|')
+        )
+        ~'negative'
+        
+        ,TRUE~'uncertain'
+      )
+  ) %>%
+  group_by(variable,pred) %>%
+  summarize(n=sum(n),.groups='drop') %>%
+  mutate(variable_num=str_count(variable,'/')+1) %>%
+  spread(pred,n,fill=0) %>%
+  mutate(
+    p=(positive+negative)/(positive+negative+uncertain)
+  )
+```
+
+```{r Show the coverage, eval=FALSE, include=FALSE}
+feat_hie_comb_dataset_training %>%
+  kable() %>%
+  kable_classic()
+```
+
+```{r Create nomogram, include=FALSE}
+nomogram=
+  pos_pred_features %>%
+  mutate(pred=1) %>%
+  rbind(
+    neg_pred_features %>%
+      mutate(pred=0)
+  ) %>%
+  mutate(variable_num=str_count(variable,'/')+1) %>%
+  mutate(position=seq(n())) %>%
+  select(pred,variable_num,position,variable,value) %>%
+  separate_rows(variable,value,sep='/') %>%
+  mutate(
+    variable=
+      variable %>%
+      factor(unique(.)) %>%
+      map_chr(~paste0('# ',as.numeric(.),' ',.,' = ____')) %>%
+      factor(rev(unique(.)))
+    ,value=
+      case_when(
+        value==0~'Negative'
+        ,value==1~'Positive'
+        ,TRUE~'Missing'
+      ) %>%
+      sapply(\(x)ifelse(x=='Missing',NA,x)) %>%
+      factor(c('Negative','Positive'))
+    ,pred=
+      case_when(
+        pred==0~paste0('Negative prediction')
+        ,pred==1~paste0('Positive prediction')
+      ) %>%
+      factor() %>%
+      factor(rev(levels(.)))
+  ) %>%
+  lapply(X=1,Y=.,\(X,Y)
+    Y %>%
+      ggplot(aes(position,variable)) +
+      geom_tile(aes(fill=factor(value)),color='white') +
+      facet_grid(~pred,scales='free_x',space='free_x',switch='x') +
+      scale_x_continuous(
+        'Iteration'
+        ,breaks=seq(1,max(Y$position),1)
+        ,expand=c(0,0)
+        ,position='top'
+      ) +
+      scale_y_discrete(
+        'Maximum-impact rank'
+        ,expand=c(0,0)
+      ) +
+      scale_fill_discrete('Predictor value') +
+      theme(
+        panel.spacing=unit(0,'lines')
+        ,panel.grid.minor=element_blank()
+        ,axis.title.y=element_text(angle=90)
+        ,axis.text.y=element_text(hjust=0)
+      )
+  ) %>%
+  .[[1]]
+```
+
+```{r figure-3, echo=FALSE, fig.height=3, fig.width=15}
+nomogram
+
+suppressMessages(suppressWarnings(ggsave('figure3.eps',height=3,width=15)))
+```
+
+# Read nomogram
+
+```{r Randomly sample a predicted positive or negative, include=FALSE}
+set.seed(seed);pred_examples=
+  sorted_nomogram_data %>%
+  .[,colnames(.) %>%
+      .[!.%in%c('outcome','outcome_onset','outcome_weight')]
+  ] %>%
+  mutate(seq=seq(n())) %>%
+  gather(predictor,value,-prob,-seq) %>%
+  group_by(seq) %>%
+  mutate(pos_predictors=sum(value)) %>%
+  ungroup() %>%
+  mutate(
+    predictor=
+      predictor %>%
+      factor(unique(.))
+  ) %>%
+  spread(predictor,value) %>%
+  arrange(seq) %>%
+  select(-seq) %>%
+  lapply(X=1,Y=.,\(X,Y)
+    list(
+        Y %>%
+          filter(pos_predictors>1 & prob>=best_model_threshold) %>%
+          slice(sample(seq(nrow(.)),1,F))
+        ,Y %>%
+          filter(pos_predictors>1 & prob<best_model_threshold) %>%
+          slice(sample(seq(nrow(.)),1,F))
+      ) %>%
+      do.call(rbind,.) %>%
+      select(-pos_predictors)
+  ) %>%
+  .[[1]]
+```
+
+```{r Show the selected samples, eval=FALSE, include=FALSE}
+pred_examples %>%
+  kable() %>%
+  kable_classic()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
